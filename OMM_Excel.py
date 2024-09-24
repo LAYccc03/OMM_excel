@@ -6,6 +6,7 @@ from openpyxl import Workbook
 from openpyxl.chart import ScatterChart, Reference, Series
 from openpyxl.chart.marker import Marker
 from openpyxl.chart.axis import ChartLines
+from openpyxl.worksheet.hyperlink import Hyperlink
 from openpyxl import load_workbook
 from PIL import Image as PILImage
 
@@ -25,7 +26,8 @@ import subprocess
 from datetime import datetime
 from PyQt5.QtWidgets import QGraphicsDropShadowEffect
 from PyQt5.QtWidgets import QWidget, QVBoxLayout, QPushButton, QLineEdit, QFileDialog, QVBoxLayout, QApplication, QLabel, QMessageBox, QDialog, QGridLayout
-from PyQt5.QtWidgets import (QTimeEdit,QHBoxLayout,QListWidget,QCheckBox,QDialogButtonBox,QListWidgetItem,QAction,QMenu,QComboBox,QSpacerItem,QSizePolicy,QProgressDialog,QTextEdit)
+from PyQt5.QtWidgets import (QTimeEdit,QHBoxLayout,QListWidget,QCheckBox,QDialogButtonBox,QListWidgetItem,QAction,QMenu,QComboBox,QSpacerItem,QSizePolicy,QProgressDialog,QTextEdit
+                             ,QAbstractItemView)
 from PyQt5.QtCore import QThread, pyqtSignal, QTimer, Qt, QSize, QTime,QDateTime
 from PyQt5.QtGui import QFont, QColor,QIcon,QPixmap,QCursor,QImage,QValidator,QPainter,QLinearGradient
 from openpyxl import load_workbook
@@ -40,9 +42,9 @@ def resource_path(relative_path):
         return os.path.join(sys._MEIPASS, relative_path)
     return os.path.join(os.path.abspath("."), relative_path)
 
-current_version = "4.3" #当前程序版本号
+current_version = "4.6" #当前程序版本号
 
-data_file_version = "3.0" #推荐使用的Excel模板
+data_file_version = "3.1" #推荐使用的Excel模板
 
 def find_rows(ws):
     # 初始化行变量为None
@@ -123,6 +125,9 @@ def find_third_sheet_cells(ws):
         'name': None, 
         'type': None,
         'diameter': None,
+        'diameter_measured_value': None,
+        'offset': None,
+        'offset_total': None,  # 用于存储 "偏移量 [总数量" 的位置（P1 单元格）
         'x_standard_value': None,
         'y_standard_value': None,
         'x_measured_value': None,
@@ -130,7 +135,7 @@ def find_third_sheet_cells(ws):
         'x_error': None,
         'y_error': None,
         'concentricity': None,
-        'concentricity_tolerance': None  # 添加“同心度公差”列的获取
+        'concentricity_tolerance': None
     }
     
     for row in ws.iter_rows():
@@ -142,6 +147,10 @@ def find_third_sheet_cells(ws):
                     cell_info_3rd['type'] = (cell.row, cell.column)
                 elif cell.value == "直径":
                     cell_info_3rd['diameter'] = (cell.row, cell.column)
+                elif cell.value == "直径测量值":
+                    cell_info_3rd['diameter_measured_value'] = (cell.row, cell.column)
+                elif cell.value == "偏移量":
+                    cell_info_3rd['offset'] = (cell.row, cell.column)
                 elif cell.value == "X 标准值":
                     cell_info_3rd['x_standard_value'] = (cell.row, cell.column)
                 elif cell.value == "Y 标准值":
@@ -156,8 +165,11 @@ def find_third_sheet_cells(ws):
                     cell_info_3rd['y_error'] = (cell.row, cell.column)
                 elif cell.value == "同心度":
                     cell_info_3rd['concentricity'] = (cell.row, cell.column)
-                elif cell.value == "同心度公差":  # 检测并获取“同心度公差”列的位置
+                elif cell.value == "同心度公差":
                     cell_info_3rd['concentricity_tolerance'] = (cell.row, cell.column)
+
+    # 直接设置 P1 单元格作为 "偏移量 [总数量" 的位置
+    cell_info_3rd['offset_total'] = (1, 16)  # P1 单元格
     
     return cell_info_3rd
 
@@ -320,12 +332,17 @@ def write_to_excel(ws, projects, rows, filename_without_extension, judgement_typ
     else:
         range_limits = []
 
-    # 初始化存储每个限制条件下所有项目的最大值和对应名称的字典
+    # 初始化存储每个限制条件下所有项目的最大值和最小值及对应名称的字典
     all_max_values = {}
     all_max_names = {}
+    all_min_values = {}
+    all_min_names = {}
     all_max_usl_values = {}
     all_max_lsl_values = {}
     all_max_nominal_values = {}
+    all_min_usl_values = {}
+    all_min_lsl_values = {}
+    all_min_nominal_values = {}
 
     for project_idx, project in enumerate(projects):
         # 使用consider_xy_center状态决定是否排除“中心坐标”
@@ -416,26 +433,24 @@ def write_to_excel(ws, projects, rows, filename_without_extension, judgement_typ
         # 重新合并单元格
         ws.merge_cells(start_row=row_inspection_date, start_column=3, end_row=row_inspection_date, end_column=5)
 
-        max_values_per_project = {}
-        max_names_per_project = {}
+        max_values_per_project = {i: float('-inf') for i in range(len(range_limits))}
+        max_names_per_project = {i: "" for i in range(len(range_limits))}
 
-        # 分解 judgement_type
+        min_values_per_project = {i: float('inf') for i in range(len(range_limits))}
+        min_names_per_project = {i: "" for i in range(len(range_limits))}
+
         if '/' in judgement_type:
             primary_type, linked_type = judgement_type.split('/')
         else:
             primary_type, linked_type = judgement_type, ""
 
-
-        # 遍历所有的限制信息
         for limit_index, limit_info in enumerate(range_limits):
             operator, limit = limit_info[0], limit_info[1] if len(limit_info) > 1 else limit_info[0]
             filtered_ids = []
 
-            # 准备前一个和下一个限制值的值（如果存在）
-            prev_limit_value = range_limits[limit_index - 1][1] if limit_index > 0 else None
-            next_limit_value = range_limits[limit_index + 1][1] if limit_index + 1 < len(range_limits) else None
+            prev_limit_value = float(range_limits[limit_index - 1][1]) if limit_index > 0 else float('-inf')
+            next_limit_value = float(range_limits[limit_index + 1][1]) if limit_index + 1 < len(range_limits) else float('inf')
 
-            # 遍历项目中的每一行数据
             for idx, (col_0, *cols_rest) in enumerate(project):
                 item_id = col_0.split(":")[0]
                 if primary_type in col_0:
@@ -443,20 +458,35 @@ def write_to_excel(ws, projects, rows, filename_without_extension, judgement_typ
 
                     valid_range = False
                     if operator == '=':
-                        valid_range = primary_value == limit
+                        valid_range = primary_value == float(limit)
                     elif operator == '>=':
-                        # 确定上限，如果下一个限制存在，则使用下一个限制作为上限，否则为无穷大
-                        upper_limit = next_limit_value if next_limit_value is not None else float('inf')
-                        valid_range = limit <= primary_value < upper_limit
+                        valid_range = float(limit) <= primary_value < next_limit_value
                     elif operator == '<=':
-                        # 确定下限，如果前一个限制存在，则使用前一个限制作为下限，否则为无穷小
-                        lower_limit = prev_limit_value if prev_limit_value is not None else float('-inf')
-                        valid_range = lower_limit < primary_value <= limit
+                        valid_range = prev_limit_value < primary_value <= float(limit)
 
                     if valid_range:
                         filtered_ids.append(item_id)
 
+            for col_0, *cols_rest in project:
+                if col_0.split(":")[0] in filtered_ids and linked_type in col_0:
+                    try:
+                        value = float(cols_rest[0]) / 2 if "位置度" in linked_type else float(cols_rest[0])
+                        usl_value = float(cols_rest[1]) / 2 if "位置度" in linked_type else float(cols_rest[1])
+                        lsl_value = 0.000  
+                        nominal_value = float(cols_rest[1]) / 2 if "位置度" in linked_type else float(cols_rest[1])
+                        name = col_0
+                    except ValueError:
+                        continue
 
+                    # 更新最大值
+                    if value > max_values_per_project[limit_index]:
+                        max_values_per_project[limit_index] = value
+                        max_names_per_project[limit_index] = name
+
+                    # 更新最小值
+                    if value < min_values_per_project[limit_index]:
+                        min_values_per_project[limit_index] = value
+                        min_names_per_project[limit_index] = name
 
 
             # 存储每个符合条件的USL和LSL值
@@ -474,34 +504,40 @@ def write_to_excel(ws, projects, rows, filename_without_extension, judgement_typ
                         # 如果转换失败，打印错误信息并跳过当前迭代
                         continue
 
-
-                    # 更新所有项目中的最大值对应的USL、LSL和Nominal
+                    # 更新最大值相关信息
                     if limit_index not in all_max_values or value > all_max_values[limit_index]:
+                        all_max_values[limit_index] = value
+                        all_max_names[limit_index] = name
                         all_max_usl_values[limit_index] = usl_value
                         all_max_lsl_values[limit_index] = lsl_value
                         all_max_nominal_values[limit_index] = nominal_value
 
-                    # 更新每个项目中的最大值和对应名称
-                    if limit_index not in max_values_per_project or value > max_values_per_project[limit_index]:
-                        max_values_per_project[limit_index] = value
-                        max_names_per_project[limit_index] = name
+                    # 更新最小值相关信息
+                    if limit_index not in all_min_values or value < all_min_values[limit_index]:
+                        all_min_values[limit_index] = value
+                        all_min_names[limit_index] = name
+                        all_min_usl_values[limit_index] = usl_value
+                        all_min_lsl_values[limit_index] = lsl_value
+                        all_min_nominal_values[limit_index] = nominal_value
 
-                    # 更新所有项目中的最大值和对应名称
-                    if limit_index not in all_max_values or value > all_max_values[limit_index]:
-                        all_max_values[limit_index] = value
-                        all_max_names[limit_index] = name
-
-        # 将每个项目的最大值写入Excel单元格
+        # 将每个项目的最大值或最小值写入Excel单元格
         for limit_index in range(len(range_limits)):
-            max_value = max_values_per_project.get(limit_index, "")
-            column_to_write = col_start - (6 - limit_index)
-            max_value_cell = ws.cell(row=row_instrument + project_idx, column=column_to_write, value=max_value)
+            if selected_method == "最大值":
+                value = max_values_per_project.get(limit_index, float('-inf'))
+            elif selected_method == "最小值":
+                value = min_values_per_project.get(limit_index, float('inf'))
+            else:
+                value = ""
 
-            # 设置单元格样式
-            max_value_cell.alignment = center_alignment
-            max_value_cell.font = Font(name='Arial', size=9, bold=True)
-            max_value_cell.number_format = '0.000'
-            max_value_cell.border = thin_border
+            if (selected_method == "最大值" and value != float('-inf')) or \
+               (selected_method == "最小值" and value != float('inf')):
+                column_to_write = col_start - (6 - limit_index)
+                value_cell = ws.cell(row=row_instrument + project_idx, column=column_to_write, value=value)
+
+                value_cell.alignment = center_alignment
+                value_cell.font = Font(name='Arial', size=9, bold=True)
+                value_cell.number_format = '0.000'
+                value_cell.border = thin_border
 
 
         for idx, (col_0, *cols_rest) in enumerate(filtered_columns):
@@ -546,21 +582,9 @@ def write_to_excel(ws, projects, rows, filename_without_extension, judgement_typ
             else:
                 cell_1.value = float(cols_rest[0])  # 使用原始值
 
-            # 定义红色粗线边框样式
-            red_thick_border = Border(left=Side(style='thick', color='FF0000'), 
-                                      right=Side(style='thick', color='FF0000'), 
-                                      top=Side(style='thick', color='FF0000'), 
-                                      bottom=Side(style='thick', color='FF0000'))
 
-            # 检查该单元格的值是否为项目最大值
-            is_max_value = any(max_values_per_project.get(limit_index, None) == float(cols_rest[0]) / 2 for limit_index in range(len(range_limits)))
-    
-            if is_max_value:
-                cell_1.font = Font(name='Arial', size=9, bold=True, color=Color(rgb='00FF0000'))  # 红色字体
-                cell_1.border = red_thick_border  # 应用红色粗线边框
-            else:
-                cell_1.font = Font(name='Arial', size=9)  # 默认字体样式
-                cell_1.border = thin_border  # 应用默认边框
+            cell_1.font = Font(name='Arial', size=9)  # 默认字体样式
+            cell_1.border = thin_border  # 应用默认边框
 
             cell_1.alignment = Alignment(horizontal='center', vertical='center')  # 设置单元格内容居中
             cell_1.number_format = '0.000'
@@ -576,6 +600,8 @@ def write_to_excel(ws, projects, rows, filename_without_extension, judgement_typ
             elif "同心度" in col_0:
                 cell_2_value = 0.000  #值固定为0
             elif "真圆度" in col_0:
+                cell_2_value = 0.000  #值固定为0
+            elif "线轮廓" in col_0:
                 cell_2_value = 0.000  #值固定为0
             elif "位置度" in col_0:
                 cell_2_value = float(cols_rest[1]) / 2
@@ -634,6 +660,9 @@ def write_to_excel(ws, projects, rows, filename_without_extension, judgement_typ
             elif "真圆度" in col_0:
                 usl_value = float(cols_rest[1])
                 lsl_value = 0.000
+            elif "线轮廓" in col_0:
+                usl_value = float(cols_rest[1])
+                lsl_value = 0.000
             elif "最大间距" in col_0:
                 usl_value = float(cols_rest[1]) + float(cols_rest[2])
                 lsl_value = float(cols_rest[1]) - float(cols_rest[3])
@@ -650,46 +679,76 @@ def write_to_excel(ws, projects, rows, filename_without_extension, judgement_typ
             cell_lsl.number_format = '0.000'
             cell_lsl.border = thin_border
 
-    # 将所有项目的最大值对应的USL、LSL和Nominal值写入Excel单元格
-    for limit_index, max_name in all_max_names.items():
+    # 定义样式
+    hyperlink_font = Font(name='Arial', size=9, bold=True, color="0000FF", underline="single")  # 蓝色带下划线
+    normal_font = Font(name='Arial', size=9, bold=True)
+
+    # 在函数开始时添加一个字典来记录每个名称对应的列位置
+    name_column_mapping = {}
+
+    # 在写入数据时记录名称和列的映射
+    for idx, (col_0, *cols_rest) in enumerate(filtered_columns):
+        col_index = col_start + idx
+        modified_col_0 = col_0.replace("位置度", "偏移量")
+        name_column_mapping[modified_col_0] = col_index
+
+    # 在写入最大值或最小值时设置超链接
+    for limit_index in range(len(range_limits)):
         column_to_write = col_start - (6 - limit_index)
 
-        # 获取最大值对应的USL、LSL和Nominal值
-        max_usl_value = all_max_usl_values.get(limit_index, "无")
-        max_lsl_value = all_max_lsl_values.get(limit_index, "无")
-        max_nominal_value = all_max_nominal_values.get(limit_index, "无")
+        if selected_method == "最大值":
+            max_name = all_max_names.get(limit_index, "")
+            max_usl_value = all_max_usl_values.get(limit_index, "")
+            max_lsl_value = all_max_lsl_values.get(limit_index, "")
+            max_nominal_value = all_max_nominal_values.get(limit_index, "")
+            modified_name = max_name.replace("位置度", "偏移量").replace('"', '')
+        elif selected_method == "最小值":
+            min_name = all_min_names.get(limit_index, "")
+            min_usl_value = all_min_usl_values.get(limit_index, "")
+            min_lsl_value = all_min_lsl_values.get(limit_index, "")
+            min_nominal_value = all_min_nominal_values.get(limit_index, "")
+            modified_name = min_name.replace("位置度", "偏移量").replace('"', '')
+        else:
+            continue  # 如果既不是最大值也不是最小值，跳过此次循环
 
         # 写入名称、USL、LSL和Nominal值
-        modified_max_name = max_name.replace("位置度", "偏移量").replace('"', '')
-        max_name_cell = ws.cell(row=row_dimension, column=column_to_write, value=modified_max_name)
-        max_usl_cell = ws.cell(row=row_usl, column=column_to_write, value=max_usl_value)
-        max_lsl_cell = ws.cell(row=row_lsl, column=column_to_write, value=max_lsl_value)
-        max_nominal_cell = ws.cell(row=row_nominal, column=column_to_write, value=max_nominal_value)
+        name_cell = ws.cell(row=row_dimension, column=column_to_write, value=modified_name)
+
+        # 设置超链接和样式
+        if modified_name in name_column_mapping:
+            target_column = name_column_mapping[modified_name]
+            target_column_letter = get_column_letter(target_column)
+            name_cell.hyperlink = Hyperlink(ref=f"{target_column_letter}:{target_column_letter}", 
+                                            location=f"'{ws.title}'!{target_column_letter}:{target_column_letter}", 
+                                            tooltip=f"跳转到 {modified_name} 列")
+            name_cell.font = hyperlink_font  # 应用超链接样式
+        else:
+            name_cell.font = normal_font  # 应用普通样式
+
+        usl_cell = ws.cell(row=row_usl, column=column_to_write, value=max_usl_value if selected_method == "最大值" else min_usl_value)
+        lsl_cell = ws.cell(row=row_lsl, column=column_to_write, value=max_lsl_value if selected_method == "最大值" else min_lsl_value)
+        nominal_cell = ws.cell(row=row_nominal, column=column_to_write, value=max_nominal_value if selected_method == "最大值" else min_nominal_value)
 
         # 设置单元格样式
-        max_name_cell.alignment = center_alignment
-        max_name_cell.font = Font(name='Arial', size=9, bold=True)
-        max_name_cell.number_format = '0.000'
-        max_name_cell.border = thin_border
-
-        # 为USL、LSL和Nominal单元格设置样式，包括背景颜色
-        for cell in [max_usl_cell, max_lsl_cell, max_nominal_cell]:
+        for cell in [name_cell, usl_cell, lsl_cell, nominal_cell]:
             cell.alignment = center_alignment
-            cell.font = Font(name='Arial', size=9, bold=True)
             cell.number_format = '0.000'
             cell.border = thin_border
-            cell.fill = PatternFill(start_color='CCFFCC', end_color='CCFFCC', fill_type='solid')  # 应用背景颜色样式
 
-
+        # 为USL、LSL和Nominal单元格设置背景颜色和字体
+        for cell in [usl_cell, lsl_cell, nominal_cell]:
+            cell.fill = PatternFill(start_color='CCFFCC', end_color='CCFFCC', fill_type='solid')
+            cell.font = normal_font
 
 
     wb = ws.parent  # 获取工作簿对象
     ws_second = wb.worksheets[second_sheet_index]  # 获取第二页工作表
 
     # 设置字体和边框样式
-    font_name_type = Font(name='等线', size=11, bold=True, color='E5E2D1')
-    font_standard_to_error = Font(name='Arial', size=11, color='E5E2D1')
-    font_judgement = Font(name='Arial', size=11, bold=True, color='E5E2D1')
+    font_name_type = Font(name='等线', size=11, bold=True, color='ffffff')
+    font_name_type2 = Font(name='等线', size=11, bold=True, color='000000')
+    font_standard_to_error = Font(name='Arial', size=11, color='ffffff')
+    font_judgement = Font(name='Arial', size=11, bold=True, color='ffffff')
     thin_black_border = Border(left=Side(style='thin', color='000000'), 
                                right=Side(style='thin', color='000000'), 
                                top=Side(style='thin', color='000000'), 
@@ -865,6 +924,9 @@ def write_to_excel(ws, projects, rows, filename_without_extension, judgement_typ
     x_error_cell_col_3rd = cell_info_3rd.get('x_error', (None, None))[1]
     y_error_cell_col_3rd = cell_info_3rd.get('y_error', (None, None))[1]
     diameter_cell_col_3rd = cell_info_3rd.get('diameter', (None, None))[1]
+    diameter_measured_value_cell_col_3rd = cell_info_3rd.get('diameter_measured_value', (None, None))[1]  # 新增：直径测量值列
+    offset_cell_col_3rd = cell_info_3rd.get('offset', (None, None))[1]  # 新增：偏移量列
+    offset_total_cell_col_3rd = cell_info_3rd.get('offset_total', (None, None))[1]  # 新增：偏移量 [总数量 列
     concentricity_cell_col_3rd = cell_info_3rd.get('concentricity', (None, None))[1]
     concentricity_tolerance_cell_col_3rd = cell_info_3rd.get('concentricity_tolerance', (None, None))[1]
 
@@ -879,10 +941,14 @@ def write_to_excel(ws, projects, rows, filename_without_extension, judgement_typ
     fill_color_1 = PatternFill(start_color='404040', end_color='404040', fill_type='solid')
     fill_color_2 = PatternFill(start_color='343434', end_color='343434', fill_type='solid')
 
-    # 筛选并合并包含“中心坐标”的数据
+    # 筛选并合并包含"中心坐标"的数据
     combined_center_coordinate_data = {}
-    diameter_data = {}  # 存储“直径”数据
-    offset_data = {}  # 存储“位置度”即“偏移量”数据
+    diameter_data = {}  # 存储"直径"标准值数据
+    diameter_measured_data = {}  # 存储"直径"测量值数据
+    diameter_usl_data = {}  # 存储"直径"上限公差数据
+    diameter_lsl_data = {}  # 存储"直径"下限公差数据
+    offset_data = {}  # 存储"位置度"即"偏移量"数据
+    offset_standard_data = {}  # 存储"位置度"的标准值数据
     for project in projects:
         filtered_columns, prompt_data = process_project(project)
         input_name = prompt_data.get("输入", "")
@@ -897,10 +963,14 @@ def write_to_excel(ws, projects, rows, filename_without_extension, judgement_typ
                     combined_center_coordinate_data[key]['Y_data'] = cols_rest
             elif "直径" in col_0:
                 diameter_key = input_name + " " + col_0.split(":")[0]  # 如 "01 圆 8"
-                diameter_data[diameter_key] = cols_rest[1]  # 存储直径的值
+                diameter_data[diameter_key] = float(cols_rest[1])  # 存储直径的标准值
+                diameter_measured_data[diameter_key] = float(cols_rest[0])  # 存储直径的测量值
+                diameter_usl_data[diameter_key] = float(cols_rest[1]) + float(cols_rest[2])  # 存储直径的上限公差
+                diameter_lsl_data[diameter_key] = float(cols_rest[1]) - float(cols_rest[3])  # 存储直径的下限公差
             elif "位置度" in col_0:
                 offset_key = input_name + " " + col_0.split(":")[0]
-                offset_data[offset_key] = float(cols_rest[1]) / 2  # 存储偏移量的值
+                offset_data[offset_key] = float(cols_rest[0]) / 2  # 存储偏移量的测量值
+                offset_standard_data[offset_key] = float(cols_rest[1]) / 2  # 存储偏移量的标准值
 
     # 创建一个列表来存储被删除的行的数据
     deleted_rows_data = []
@@ -929,12 +999,12 @@ def write_to_excel(ws, projects, rows, filename_without_extension, judgement_typ
     # 按照X和Y标准值大小进行排序
     sorted_group_keys = sorted(filtered_grouped_data.keys(), key=lambda x: (x[0], x[1], x[2]))
 
-    # 写入合并后的“中心坐标”数据
+    # 写入合并后的"中心坐标"数据
     current_row_3rd = name_cell_row_3rd + 1
     use_first_color = True  # 初始时使用第一种颜色
     for group_key in sorted_group_keys:
         group_values = filtered_grouped_data[group_key]
-        max_concentricity_tolerance = max([offset_data.get(value['input_name'] + " " + value['type'], 0) for value in group_values])  # 获取最大同心度公差
+        max_concentricity_tolerance = max([offset_standard_data.get(value['input_name'] + " " + value['type'], 0) for value in group_values])  # 获取最大同心度公差
         exceed_tolerance = False  # 初始化同心度是否超过公差的标志
 
         # 计算同心度，检查是否超过公差
@@ -949,7 +1019,7 @@ def write_to_excel(ws, projects, rows, filename_without_extension, judgement_typ
 
         for i in range(len(group_values)):
             value = group_values[i]
-            # 写入“名称”和“类型”
+            # 写入"名称"和"类型"
             ws_third.cell(row=current_row_3rd, column=name_cell_col_3rd, value=value['input_name'])
             ws_third.cell(row=current_row_3rd, column=type_cell_col_3rd, value=value['type'] + ": X中心坐标, Y中心坐标")
 
@@ -979,15 +1049,29 @@ def write_to_excel(ws, projects, rows, filename_without_extension, judgement_typ
             cell_y_error = ws_third.cell(row=current_row_3rd, column=y_error_cell_col_3rd, value=y_error)
             cell_y_error.number_format = '0.000'
 
-            # 查找并写入对应的“直径”值
+            # 查找并写入对应的"直径"值
             diameter_key = value['input_name'] + " " + value['type']
             if diameter_key in diameter_data:
-                diameter_value = float(diameter_data[diameter_key])
+                diameter_value = diameter_data[diameter_key]
                 cell_diameter = ws_third.cell(row=current_row_3rd, column=diameter_cell_col_3rd, value=diameter_value)
             else:
-                # 如果没有找到对应的“直径”值，可以选择写入默认值或者留空
-                cell_diameter = ws_third.cell(row=current_row_3rd, column=diameter_cell_col_3rd, value=None)  # 或者设置默认值，例如0.000
+                cell_diameter = ws_third.cell(row=current_row_3rd, column=diameter_cell_col_3rd, value=None)
             cell_diameter.number_format = '0.000'
+
+            # 写入直径测量值
+            if diameter_key in diameter_measured_data:
+                diameter_measured_value = diameter_measured_data[diameter_key]
+                cell_diameter_measured = ws_third.cell(row=current_row_3rd, column=diameter_measured_value_cell_col_3rd, value=diameter_measured_value)
+                cell_diameter_measured.number_format = '0.000'
+
+
+            # 写入偏移量测量值
+            offset_key = value['input_name'] + " " + value['type']
+            if offset_key in offset_data and offset_key in offset_standard_data:
+                offset_measured_value = offset_data[offset_key]
+                offset_standard_value = offset_standard_data[offset_key]
+                cell_offset = ws_third.cell(row=current_row_3rd, column=offset_cell_col_3rd, value=offset_measured_value)
+                cell_offset.number_format = '0.000'
 
             # 计算同心度并写入（只在第一个匹配项中添加同心度）
             if i == 0 and len(group_values) > 1:
@@ -1021,6 +1105,32 @@ def write_to_excel(ws, projects, rows, filename_without_extension, judgement_typ
                 else:
                     cell.fill = current_fill_color
 
+                # 检查偏移量测量值是否大于标准值
+                if col == offset_cell_col_3rd and offset_key in offset_data and offset_key in offset_standard_data:
+                    offset_measured_value = offset_data[offset_key]
+                    offset_standard_value = offset_standard_data[offset_key]
+                    if offset_measured_value > offset_standard_value:
+                        cell.fill = PatternFill(start_color='E26B0A', end_color='E26B0A', fill_type='solid')
+                        # 在 offset_total_cell_col_3rd 列写入 1
+                        if offset_total_cell_col_3rd is not None:
+                            offset_total_cell = ws_third.cell(row=current_row_3rd, column=offset_total_cell_col_3rd, value=1)
+                            offset_total_cell.number_format = '0'  # 设置为整数格式
+                            offset_total_cell.fill = PatternFill(start_color='F2F2F2', end_color='F2F2F2', fill_type='solid')  # 设置背景色为 #F2F2F2
+                    else:
+                        # 在 offset_total_cell_col_3rd 列写入 0
+                        if offset_total_cell_col_3rd is not None:
+                            offset_total_cell = ws_third.cell(row=current_row_3rd, column=offset_total_cell_col_3rd, value=0)
+                            offset_total_cell.number_format = '0'  # 设置为整数格式
+                            offset_total_cell.fill = PatternFill(start_color='F2F2F2', end_color='F2F2F2', fill_type='solid')  # 设置背景色为 #F2F2F2
+
+                # 检查直径测量值是否超出公差范围
+                if col == diameter_measured_value_cell_col_3rd and diameter_key in diameter_measured_data:
+                    measured_value = diameter_measured_data[diameter_key]
+                    usl_value = diameter_usl_data[diameter_key]
+                    lsl_value = diameter_lsl_data[diameter_key]
+                    if measured_value > usl_value or measured_value < lsl_value:
+                        cell.fill = PatternFill(start_color='632523', end_color='632523', fill_type='solid')
+
             current_row_3rd += 1
 
         # 在处理完每个匹配项后改变颜色
@@ -1028,7 +1138,7 @@ def write_to_excel(ws, projects, rows, filename_without_extension, judgement_typ
 
     # 在匹配行后添加没有匹配的单行数据
     for value in deleted_rows_data:
-        # 写入“名称”和“类型”
+        # 写入"名称"和"类型"
         ws_third.cell(row=current_row_3rd, column=name_cell_col_3rd, value=value['input_name'])
         ws_third.cell(row=current_row_3rd, column=type_cell_col_3rd, value=value['type'] + ": X中心坐标, Y中心坐标")
 
@@ -1064,15 +1174,29 @@ def write_to_excel(ws, projects, rows, filename_without_extension, judgement_typ
             cell_y_error = ws_third.cell(row=current_row_3rd, column=y_error_cell_col_3rd, value=y_error)
             cell_y_error.number_format = '0.000'
 
-        # 写入“直径”值
+        # 写入"直径"值和测量值
         diameter_key = value['input_name'] + " " + value['type']
         if diameter_key in diameter_data:
-            diameter_value = float(diameter_data[diameter_key])
+            diameter_value = diameter_data[diameter_key]
             cell_diameter = ws_third.cell(row=current_row_3rd, column=diameter_cell_col_3rd, value=diameter_value)
+            cell_diameter.number_format = '0.000'
+
+            if diameter_key in diameter_measured_data:
+                diameter_measured_value = diameter_measured_data[diameter_key]
+                cell_diameter_measured = ws_third.cell(row=current_row_3rd, column=diameter_measured_value_cell_col_3rd, value=diameter_measured_value)
+                cell_diameter_measured.number_format = '0.000'
         else:
-            # 如果没有找到对应的“直径”值，可以选择写入默认值或者留空
+            # 如果没有找到对应的"直径"值，可以选择写入默认值或者留空
             cell_diameter = ws_third.cell(row=current_row_3rd, column=diameter_cell_col_3rd, value=None)  # 或者设置默认值，例如0.000
         cell_diameter.number_format = '0.000'
+
+        # 写入偏移量测量值
+        offset_key = value['input_name'] + " " + value['type']
+        if offset_key in offset_data and offset_key in offset_standard_data:
+            offset_measured_value = offset_data[offset_key]
+            offset_standard_value = offset_standard_data[offset_key]
+            cell_offset = ws_third.cell(row=current_row_3rd, column=offset_cell_col_3rd, value=offset_measured_value)
+            cell_offset.number_format = '0.000'
 
         # 为每个单元格设置样式（字体、边框、背景颜色）
         for col in range(name_cell_col_3rd, concentricity_cell_col_3rd + 1):  # 从名称列到同心度列
@@ -1080,6 +1204,32 @@ def write_to_excel(ws, projects, rows, filename_without_extension, judgement_typ
             cell.font = font_style
             cell.border = thin_black_border
             cell.fill = fill_color_1
+
+            # 检查偏移量测量值是否大于标准值
+            if col == offset_cell_col_3rd and offset_key in offset_data and offset_key in offset_standard_data:
+                offset_measured_value = offset_data[offset_key]
+                offset_standard_value = offset_standard_data[offset_key]
+                if offset_measured_value > offset_standard_value:
+                    cell.fill = PatternFill(start_color='E26B0A', end_color='E26B0A', fill_type='solid')
+                    # 在 offset_total_cell_col_3rd 列写入 1
+                    if offset_total_cell_col_3rd is not None:
+                        offset_total_cell = ws_third.cell(row=current_row_3rd, column=offset_total_cell_col_3rd, value=1)
+                        offset_total_cell.number_format = '0'  # 设置为整数格式
+                        offset_total_cell.fill = PatternFill(start_color='F2F2F2', end_color='F2F2F2', fill_type='solid')  # 设置背景色为 #F2F2F2
+                else:
+                    # 在 offset_total_cell_col_3rd 列写入 0
+                    if offset_total_cell_col_3rd is not None:
+                        offset_total_cell = ws_third.cell(row=current_row_3rd, column=offset_total_cell_col_3rd, value=0)
+                        offset_total_cell.number_format = '0'  # 设置为整数格式
+                        offset_total_cell.fill = PatternFill(start_color='F2F2F2', end_color='F2F2F2', fill_type='solid')  # 设置背景色为 #F2F2F2
+
+            # 检查直径测量值是否超出公差范围
+            if col == diameter_measured_value_cell_col_3rd and diameter_key in diameter_measured_data:
+                measured_value = diameter_measured_data[diameter_key]
+                usl_value = diameter_usl_data[diameter_key]
+                lsl_value = diameter_lsl_data[diameter_key]
+                if measured_value > usl_value or measured_value < lsl_value:
+                    cell.fill = PatternFill(start_color='632523', end_color='632523', fill_type='solid')
 
         current_row_3rd += 1
 
@@ -1131,7 +1281,7 @@ def write_to_excel(ws, projects, rows, filename_without_extension, judgement_typ
         if type_measurement_counts[type_name] == 0:
             # 写入“类型”，并应用样式
             type_cell = ws_fourth.cell(row=row_for_type, column=type_cell_col, value=col_0)
-            type_cell.font = font_name_type
+            type_cell.font = font_name_type2
             type_cell.border = thin_black_border
             type_cell.alignment = left_alignment  # “类型”单元格左对齐
 
@@ -1144,7 +1294,7 @@ def write_to_excel(ws, projects, rows, filename_without_extension, judgement_typ
             # 查找相同名称的直径数据的标准值并写入
             if diameter_standard_value is not None and diameter_col is not None:
                 diameter_cell = ws_fourth.cell(row=row_for_type, column=diameter_col, value=diameter_standard_value)
-                diameter_cell.font = font_name_type
+                diameter_cell.font = font_name_type2
                 diameter_cell.border = thin_black_border
                 diameter_cell.alignment = right_alignment  # 设置为右对齐
                 diameter_cell.number_format = '0.000'
@@ -1157,7 +1307,7 @@ def write_to_excel(ws, projects, rows, filename_without_extension, judgement_typ
                     break
             if offset_standard_value is not None and standard_value_col is not None:
                 standard_value_cell = ws_fourth.cell(row=row_for_type, column=standard_value_col, value=offset_standard_value)
-                standard_value_cell.font = font_name_type
+                standard_value_cell.font = font_name_type2
                 standard_value_cell.border = thin_black_border
                 standard_value_cell.alignment = right_alignment
                 standard_value_cell.number_format = '0.000'
@@ -1171,7 +1321,7 @@ def write_to_excel(ws, projects, rows, filename_without_extension, judgement_typ
         if offset_measured_value is not None:
             # 写入测量值
             measured_value_cell = ws_fourth.cell(row=row_for_type, column=current_measured_value_col, value=float(measure_value) / 2)
-            measured_value_cell.font = font_name_type
+            measured_value_cell.font = font_name_type2
             measured_value_cell.border = thin_black_border
             measured_value_cell.alignment = right_alignment
             measured_value_cell.number_format = '0.0000'
@@ -1203,7 +1353,7 @@ def write_to_excel(ws, projects, rows, filename_without_extension, judgement_typ
     aux_col = end_col + 1
     for i, row_num in enumerate(range(start_row, end_row + 1), start=0):
         aux_cell = ws_fourth.cell(row=row_num, column=aux_col, value=i)
-        aux_cell.font = font_name_type
+        aux_cell.font = font_name_type2
         aux_cell.border = thin_black_border
         aux_cell.alignment = right_alignment  # 辅助列也设置为右对齐
 
@@ -1245,8 +1395,8 @@ def write_to_excel(ws, projects, rows, filename_without_extension, judgement_typ
     chart.height = 15  # 散点图的高度，单位为英寸
 
     # 定义背景色填充样式
-    fill_measurements = PatternFill(start_color='303030', end_color='303030', fill_type='solid')  # 测量值列的背景色
-    fill_others = PatternFill(start_color='404040', end_color='404040', fill_type='solid')  # 其他列的背景色
+    fill_measurements = PatternFill(start_color='ffffff', end_color='ffffff', fill_type='solid')  # 测量值列的背景色
+    fill_others = PatternFill(start_color='ffffff', end_color='ffffff', fill_type='solid')  # 其他列的背景色
     fill_aux_after = PatternFill(start_color='F2F2F2', end_color='F2F2F2', fill_type='solid')  # 辅助列之后的背景色
 
     # 应用背景色填充到所有相关单元格
@@ -1734,9 +1884,31 @@ class UpdateCheckerThread(QThread):
         except requests.RequestException as e:
             self.update_check_failed.emit(str(e))
 
-    def is_newer_version(self, latest, current):
-        # 简单的字符串比较，可能需要根据版本号格式进行更复杂的比较
-        return latest > current
+    def is_newer_version(self, version1, version2):
+        """
+        比较两个版本号字符串，确定version1是否比version2新
+    
+        参数:
+        version1 (str): 第一个版本号
+        version2 (str): 第二个版本号
+    
+        返回:
+        bool: 如果version1比version2新，返回True；否则返回False
+        """
+        # 处理"未知"版本号的情况
+        if version1 == "未知" or version2 == "未知":
+            return False
+    
+        try:
+            # 将版本号字符串转换为整数列表
+            v1_parts = list(map(int, version1.split('.')))
+            v2_parts = list(map(int, version2.split('.')))
+        except ValueError:
+            # 如果转换失败（非数字字符），视为无效版本号
+            return False
+    
+        # 比较版本号
+        return v1_parts > v2_parts
 
 
 class UpdateDialog(QDialog):
@@ -1870,98 +2042,163 @@ class MainWindow(QWidget):
             json.dump(version_info, file, indent=4)
 
     def check_for_updates(self):
-        # GitHub的API路径，获取最新发布信息
+        """
+        初始化并启动更新检查线程。
+        这个方法设置了更新检查器线程，连接相关的信号，并开始检查过程。
+        """
+        # 初始化更新检查器线程，传入GitHub API路径和当前版本号
         self.update_checker = UpdateCheckerThread(
             "https://api.github.com/repos/LAYccc03/OMM_excel/releases/latest",
-            self.current_version)  # 传递当前版本号
+            self.current_version)
+    
+        # 连接更新检查器的信号到相应的槽函数
         self.update_checker.update_available.connect(self.prompt_for_update)
         self.update_checker.update_check_finished.connect(self.on_update_check_finished)
         self.update_checker.update_check_failed.connect(self.on_update_check_failed)
+    
+        # 启动更新检查线程
         self.update_checker.start()
+    
+        # 显示正在检查更新的消息
         self.show_update_checking_message()
 
 
 
     def show_update_checking_message(self):
+        """显示正在检查更新的消息框"""
         self.checking_update_msg = QMessageBox(self)
         self.checking_update_msg.setWindowTitle("检查更新")
         self.checking_update_msg.setText("正在检查更新，请稍候...")
-        self.checking_update_msg.setStandardButtons(QMessageBox.NoButton)
+    
+        # 添加关闭按钮
+        close_button = QPushButton("关闭")
+        self.checking_update_msg.addButton(close_button, QMessageBox.RejectRole)
+    
+        # 连接关闭按钮的点击事件
+        close_button.clicked.connect(self.checking_update_msg.close)
+    
+        # 设置为非模态，允许用户与主窗口交互
+        self.checking_update_msg.setWindowModality(Qt.NonModal)
+    
+        # 显示消息框
         self.checking_update_msg.show()
 
     def on_update_check_finished(self):
-        self.checking_update_msg.accept()
+        """更新检查完成时关闭消息框"""
+        if hasattr(self, 'checking_update_msg'):
+            self.checking_update_msg.accept()
 
     def on_update_check_failed(self, error_message):
-        # 创建QMessageBox实例而不是直接调用静态方法
+        """更新检查失败时显示错误消息并关闭检查更新的消息框"""
+        # 创建错误消息框
         msgBox = QMessageBox(self)
         msgBox.setIcon(QMessageBox.Critical)
         msgBox.setWindowTitle("更新检查失败")
         msgBox.setText(error_message)
-        msgBox.setStandardButtons(QMessageBox.Ok)  # 设置一个OK按钮
+        msgBox.setStandardButtons(QMessageBox.Ok)
         msgBox.show()
 
-        self.checking_update_msg.accept()  # 关闭正在检查更新的对话框
-    
-        # 使用QTimer来延迟关闭消息框
-        QTimer.singleShot(2000, msgBox.accept)  # 2000毫秒后关闭
+        # 关闭正在检查更新的对话框
+        if hasattr(self, 'checking_update_msg'):
+            self.checking_update_msg.accept()
+
+        # 使用QTimer来延迟关闭错误消息框
+        QTimer.singleShot(2000, msgBox.accept)  # 2000毫秒后自动关闭
 
 
     def prompt_for_update(self, latest_version, program_download_url, description, latest_data_file_version, data_file_download_url):
-        current_data_file_version_in_program = self.find_current_data_file_version()  # 获取当前程序位置下的数据文件版本
+        """
+        当检测到更新时，提示用户是否要更新程序和/或数据模板。
+    
+        参数:
+        latest_version (str): 最新的程序版本
+        program_download_url (str): 程序下载URL
+        description (str): 更新描述
+        latest_data_file_version (str): 最新的数据模板版本
+        data_file_download_url (str): 数据模板下载URL
+        """
+        # 获取当前程序中识别到的数据模板版本
+        current_data_file_version_in_program = self.find_current_data_file_version()
 
+        # 准备版本信息字符串
         version_info = (f"当前程序版本：{self.current_version}\n"
                         f"当前版本推荐数据模板：{self.data_file_version}\n"
                         f"当前程序内识别到的数据模板版本：{current_data_file_version_in_program}\n\n"
                         f"发现新程序版本：{latest_version}\n"
-                        f"新版本推荐数据模板：{latest_data_file_version}")
+                        f"新版本推荐数据模板：{latest_data_file_version or '未知'}")
 
-        # 检查程序是否已是最新版本
-        if self.current_version == latest_version and data_file_download_url:
-            # 程序版本最新，检查数据模板是否需要更新
-            self.prompt_for_data_template_update(latest_data_file_version, data_file_download_url)
-        elif self.current_version != latest_version:
-            # 程序有新版本，处理程序更新逻辑
-            dialog = UpdateDialog(self, version_info, program_download_url, description)
-            accepted = dialog.exec_() == QDialog.Accepted
-            if accepted:
-                self.download_and_update(program_download_url, data_file_download_url)
+        if self.current_version == latest_version:
+            # 如果程序版本已是最新，检查是否有数据模板更新
+            if data_file_download_url:
+                self.prompt_for_data_template_update(latest_data_file_version, data_file_download_url)
             else:
-                # 用户取消程序更新，但可能需要更新数据模板
+                QMessageBox.information(self, "更新检查", "当前程序已是最新版本，且没有新的数据模板更新。")
+        else:
+            # 如果有新版本程序，弹出更新对话框
+            dialog = UpdateDialog(self, version_info, program_download_url, description)
+            if dialog.exec_() == QDialog.Accepted:
+                # 用户选择更新，下载并更新程序和数据模板（如果有）
+                self.download_and_update(program_download_url, data_file_download_url)
+            elif data_file_download_url:
+                # 用户取消程序更新，但仍可能需要更新数据模板
                 self.prompt_for_data_template_update(latest_data_file_version, data_file_download_url)
 
 
-
-
-
     def download_and_update(self, program_download_url=None, data_file_download_url=None):
+        """
+        下载并更新程序和/或数据模板。
+    
+        参数:
+        program_download_url (str, 可选): 程序下载URL
+        data_file_download_url (str, 可选): 数据模板下载URL
+        """
         try:
             program_file_path = None
             data_template_file_path = None
 
+            # 下载程序更新（如果有）
             if program_download_url:
-                # 下载新版本程序
                 program_file_path = self.download_file(program_download_url, "程序")
         
+            # 下载数据模板更新（如果有）
             if data_file_download_url:
-                # 检查并下载数据模板
                 data_template_file_path = self.download_file(data_file_download_url, "数据模板")
 
+            # 处理下载结果
             if program_file_path:
-                # 如果有程序文件下载，替换旧版本的程序并启动新版本
-                # 此时，如果也有数据模板下载，则一并处理
+                # 如果下载了新程序，替换旧程序并重启
                 self.replace_and_restart(program_file_path, os.path.basename(program_file_path), data_template_file_path)
             elif data_template_file_path:
-                # 如果只有数据模板文件下载，直接移动到程序所在目录
+                # 如果只下载了数据模板，移动到程序目录
                 self.move_file_to_program_dir(data_template_file_path)
+            else:
+                # 如果没有下载任何文件
+                QMessageBox.information(self, "更新", "没有可用的更新文件。")
 
         except requests.RequestException as e:
-            QMessageBox.critical(self, "下载失败", f"下载新版本失败：{e}")
+            # 处理下载过程中的网络错误
+            QMessageBox.critical(self, "下载失败", f"下载更新失败：{e}")
 
 
     def prompt_for_data_template_update(self, latest_data_file_version, data_file_download_url):
+        """
+        提示用户是否要更新数据模板。
+    
+        参数:
+        latest_data_file_version (str): 最新的数据模板版本
+        data_file_download_url (str): 数据模板下载URL
+        """
+        # 检查是否有可用的数据模板更新信息
+        if not latest_data_file_version or not data_file_download_url:
+            QMessageBox.information(self, "数据模板更新", "无法获取新的数据模板信息。")
+            return
+
+        # 获取当前数据模板版本
         current_data_file_version = self.find_current_data_file_version()
+    
+        # 检查是否需要更新
         if current_data_file_version == "未知" or self.is_newer_version(latest_data_file_version, current_data_file_version):
+            # 弹出询问用户是否更新的对话框
             reply = QMessageBox.question(self, "数据模板更新可用",
                                          f"当前数据模板版本：{current_data_file_version}\n\n"
                                          f"发现新数据模板版本：{latest_data_file_version}\n\n"
@@ -1969,7 +2206,8 @@ class MainWindow(QWidget):
                                          QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
 
             if reply == QMessageBox.Yes:
-                self.download_and_update(None, data_file_download_url)  # 只更新数据模板
+                # 用户选择更新，只更新数据模板
+                self.download_and_update(None, data_file_download_url)
 
 
     def move_file_to_program_dir(self, file_path):
@@ -1980,7 +2218,16 @@ class MainWindow(QWidget):
 
 
     def download_file(self, download_url, file_type):
-        """通用文件下载方法"""
+        """
+        下载文件并显示进度。
+
+        参数:
+        download_url (str): 文件下载URL
+        file_type (str): 文件类型描述（用于显示）
+
+        返回:
+        str: 下载文件的临时路径，如果下载失败则返回 None
+        """
         try:
             response = requests.get(download_url, stream=True)
             response.raise_for_status()
@@ -1990,7 +2237,8 @@ class MainWindow(QWidget):
             file_path = os.path.join(temp_dir, filename)
 
             total_length = int(response.headers.get('content-length', 0))
-            progress_dialog = QProgressDialog(f"正在下载新{file_type}...", "取消", 0, total_length, self)
+
+            progress_dialog = QProgressDialog(f"正在下载新{file_type}...", "取消", 0, 100, self)
             progress_dialog.setWindowTitle(f"下载{file_type}更新")
             progress_dialog.setWindowModality(Qt.WindowModal)
             progress_dialog.setAutoClose(True)
@@ -2000,25 +2248,42 @@ class MainWindow(QWidget):
             start_time = time.time()
             with open(file_path, "wb") as file:
                 for data in response.iter_content(chunk_size=4096):
-                    downloaded += len(data)
+                    size = len(data)
                     file.write(data)
+                    downloaded += size
                     elapsed_time = time.time() - start_time
-                    download_speed = downloaded / elapsed_time / 1024 / 1024  # MB/s
-                    progress_dialog.setValue(downloaded)
-                    progress_dialog.setLabelText(f"下载中: {downloaded/1024/1024:.2f}MB / {total_length/1024/1024:.2f}MB    下载速度：{download_speed:.2f}MB/s")
+
+                    if elapsed_time > 0 and total_length > 0:
+                        download_speed = downloaded / elapsed_time / 1024 / 1024  # MB/s
+                        percent = int(100 * downloaded / total_length)
+                    else:
+                        download_speed = 0
+                        percent = 0
+
+                    progress_dialog.setValue(percent)
+                    progress_dialog.setLabelText(
+                        f"下载中: {downloaded/1024/1024:.2f}MB / {total_length/1024/1024:.2f}MB    "
+                        f"下载速度：{download_speed:.2f}MB/s"
+                    )
                     QApplication.processEvents()
-            
+
                     if progress_dialog.wasCanceled():
-                        QMessageBox.warning(self, f"下载{file_type}取消", f"{file_type}更新下载已取消。")
+                        progress_dialog.close()
                         return None
 
             progress_dialog.close()
-            return file_path  # 返回下载文件的路径
+            return file_path
+
         except requests.RequestException as e:
-            QMessageBox.critical(self, "下载失败", f"下载{file_type}失败：{e}")
+            self.show_error_message(f"下载{file_type}失败", str(e))
+            return None
+        except Exception as e:
+            self.show_error_message(f"下载{file_type}时发生错误", str(e))
             return None
 
-
+    def show_error_message(self, title, message):
+        """显示错误消息对话框"""
+        QMessageBox.critical(self, title, message)
 
 
     def replace_and_restart(self, new_executable_path, new_filename, new_data_template_path=None):
@@ -2055,13 +2320,6 @@ class MainWindow(QWidget):
 
         subprocess.Popen(["cmd.exe", "/c", script_path], cwd=current_dir, close_fds=True)
         self.close()
-
-
-
-
-
-
-
 
 
     def save_shift_times_to_file(self):
@@ -2453,10 +2711,68 @@ class MainWindow(QWidget):
 
 
     def browse_template(self):
-        self.template_path = QFileDialog.getOpenFileName(self, '选择模板文件', '', 'Excel files (*.xlsx)')[0]
-        if self.template_path:  # 确保用户选中了文件
+        """
+        打开文件对话框让用户选择模板文件，并检查所选文件的版本。
+        如果选择的不是最新版本，会显示警告消息。
+        """
+        template_path = QFileDialog.getOpenFileName(self, '选择模板文件', '', 'Excel files (*.xlsx)')[0]
+        if template_path:  # 确保用户选中了文件
+            # 检查模板版本
+            template_version = self.get_template_version(template_path)
+            if template_version != data_file_version:
+                reply = QMessageBox.warning(self, '版本不匹配',
+                                            f'选择的模板版本 (v{template_version}) 与当前程序支持的版本 (v{data_file_version}) 不匹配。\n'
+                                            '使用不匹配的版本可能会导致转换错误。\n\n'
+                                            '是否仍然使用该模板？',
+                                            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+                if reply == QMessageBox.No:
+                    return  # 用户选择不使用该模板，直接返回
+
+            # 更新模板路径
+            self.template_path = template_path
             self.template_line_edit.setText(self.template_path)
             self.save_paths_to_file()  # 保存路径
+
+    def get_template_version(self, template_path):
+        """
+        从Excel模板文件名中提取版本号。
+    
+        参数:
+        template_path (str): Excel模板文件的路径
+
+        返回:
+        str: 模板的版本号，如果无法获取则返回"未知"
+        """
+        filename = os.path.basename(template_path)
+        pattern = re.compile(r'数据模板(\d+\.\d+)|v(\d+\.\d+)\.xlsx', re.IGNORECASE)
+        match = pattern.search(filename)
+        if match:
+            # 返回找到的第一个非空的捕获组
+            version = match.group(1) or match.group(2)
+            return version
+        return "未知"
+
+    def is_newer_version(self, version1, version2):
+        """
+        比较两个版本号字符串，确定version1是否比version2新
+    
+        参数:
+        version1 (str): 第一个版本号
+        version2 (str): 第二个版本号
+    
+        返回:
+        bool: 如果version1比version2新，返回True；否则返回False
+        """
+        if version1 == "未知" or version2 == "未知":
+            return False
+    
+        try:
+            v1_parts = list(map(int, version1.split('.')))
+            v2_parts = list(map(int, version2.split('.')))
+        except ValueError:
+            return False
+    
+        return v1_parts > v2_parts
 
     def reset_conversion_data(self):
         # 重置已转换文件的列表和文件计数
@@ -2501,6 +2817,18 @@ class MainWindow(QWidget):
     def run_clicked(self):
         if not self.is_running:
             if self.template_path and self.folder_path:
+                # 检查模板版本
+                template_version = self.get_template_version(self.template_path)
+                if template_version != self.data_file_version:
+                    reply = QMessageBox.warning(self, '版本不匹配',
+                                                f'当前使用的模板版本 (v{template_version}) 与程序支持的版本 (v{self.data_file_version}) 不匹配。\n'
+                                                '使用不匹配的版本可能会导致转换错误。\n\n'
+                                                '是否仍要继续运行？',
+                                                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+                    if reply == QMessageBox.No:
+                        return  # 用户选择不继续，直接返回
+
+                # 版本检查通过或用户确认继续，开始运行
                 self.is_running = True
                 self.run_button.setText("STOP")
                 self.colorBlock.setGradientColors('#f5af19', '#f12711', is_breathing=False)  # 设置为滚动渐变
@@ -2513,6 +2841,7 @@ class MainWindow(QWidget):
             self.run_button.setText("RUN")
             self.colorBlock.setGradientColors('#36D1DC', '#5B86E5')  # 恢复呼吸渐变
             self.timer.stop()
+
 
     def show_toast(self, message):
         toast = Toast(message, width=200, height=50, parent=self)
@@ -2825,6 +3154,7 @@ class FolderListDialog(QDialog):
     def __init__(self, folder_path, parent=None):
         super().__init__(parent)
         self.folder_path = folder_path
+        self.full_folder_list = []  # 存储完整的文件夹和Excel文件列表
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.load_folder_list)
         self.outside_check_timer = QTimer(self)
@@ -2960,7 +3290,7 @@ class FolderListDialog(QDialog):
     def open_similar_excel(self, folder_name):
         # 寻找与文件夹名称最相似的 Excel 文件
         excel_path, similarity = self.find_most_similar_excel(folder_name)
-        if similarity >= 0.7 and os.path.exists(excel_path):
+        if excel_path and os.path.exists(excel_path):
             if os.name == 'nt':
                 os.startfile(excel_path)
             elif os.name == 'posix':
@@ -2969,15 +3299,48 @@ class FolderListDialog(QDialog):
             QMessageBox.information(self, "信息", "未找到相似的 Excel 文件或文件不存在。")
 
     def find_most_similar_excel(self, folder_name):
-        highest_similarity = 0.0
         most_similar_path = ""
+        highest_similarity = 0.0
+        folder_name_lower = folder_name.lower()
+
         for file_name in os.listdir(self.folder_path):
             if file_name.lower().endswith('.xlsx'):
-                similarity = difflib.SequenceMatcher(None, folder_name, file_name).ratio()
+                file_name_lower = file_name.lower()
+                
+                # 移除文件扩展名
+                file_name_without_ext = os.path.splitext(file_name_lower)[0]
+                
+                # 计算最长公共子串
+                lcs_length = self.longest_common_substring(folder_name_lower, file_name_without_ext)
+                
+                # 计算相似度得分
+                similarity = lcs_length / max(len(folder_name_lower), len(file_name_without_ext))
+                
+                # 额外检查：文件名是否包含文件夹名的全部单词
+                folder_words = set(folder_name_lower.split())
+                file_words = set(file_name_without_ext.split())
+                if folder_words.issubset(file_words):
+                    similarity += 0.3  # 增加相似度得分
+                
                 if similarity > highest_similarity:
                     highest_similarity = similarity
                     most_similar_path = os.path.join(self.folder_path, file_name)
+
         return most_similar_path, highest_similarity
+
+    def longest_common_substring(self, s1, s2):
+        m = [[0] * (1 + len(s2)) for _ in range(1 + len(s1))]
+        longest, x_longest = 0, 0
+        for x in range(1, 1 + len(s1)):
+            for y in range(1, 1 + len(s2)):
+                if s1[x - 1] == s2[y - 1]:
+                    m[x][y] = m[x - 1][y - 1] + 1
+                    if m[x][y] > longest:
+                        longest = m[x][y]
+                        x_longest = x
+                else:
+                    m[x][y] = 0
+        return longest
 
 
 
@@ -3009,10 +3372,12 @@ class FolderListDialog(QDialog):
     def moveEvent(self, event):
         super().moveEvent(event)
         self.update_details_dialog_position()
+        self.update_rename_dialog_position()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self.update_details_dialog_position()
+        self.update_rename_dialog_position()
 
     def update_details_dialog_position(self):
         # 更新子窗口位置
@@ -3045,105 +3410,109 @@ class FolderListDialog(QDialog):
         self.show()  # 重新显示窗口以应用新的窗口标志
 
     def load_folder_list(self):
+        """
+        加载并显示文件夹列表，包括橙色高亮显示变化的文件夹，
+        并在更新后自动滚动到第一个高亮项目。
+        文件夹按图片数量从小到大排序。
+        """
+        self.list_widget.clear()
+        self.full_folder_list = []
+        folder_info_list = []
+        excel_info_list = []
+        first_highlighted_item = None
+
         # 获取当前文件夹状态
         current_folder_info = self.record_all_folder_info()
 
-        self.list_widget.clear()  # 清空当前列表
-        folder_info_list = []  # 存储文件夹和图片数量
-        excel_info_list = []  # 单独存储Excel文件信息
-
         if os.path.isdir(self.folder_path):
-            for item in os.listdir(self.folder_path):
-                # 跳过以 '~$' 开头的临时文件
-                if item.startswith('~$'):
-                    continue
+            with os.scandir(self.folder_path) as entries:
+                for entry in entries:
+                    if entry.name.startswith('~$'):
+                        continue
+                    if entry.is_dir():
+                        image_count, other_count = self.count_files_fast(entry.path)
+                        folder_info_list.append((entry.name, image_count, other_count))
+                    elif entry.name.lower().endswith('.xlsx'):
+                        excel_info_list.append(entry.name)
 
-                full_path = os.path.join(self.folder_path, item)
-                if os.path.isdir(full_path):
-                    image_count = self.count_files(full_path, ['.jpg', '.jpeg', '.png', '.gif'])
-                    other_count = self.count_files(full_path, ['.txt', '.pdf', '.docx'])
-                    folder_info_list.append((item, image_count, other_count))
-                elif item.lower().endswith('.xlsx'):
-                    excel_info_list.append(item)
-
-        # 按图片数量排序文件夹，然后按名称排序Excel文件
+        # 按图片数量从小到大排序
         folder_info_list.sort(key=lambda x: x[1])
         excel_info_list.sort()
 
-        # 过滤掉与文件夹名称高度相似的Excel文件
-        filtered_excel_info_list = []
-        for excel_file in excel_info_list:
-            excel_file_name = os.path.splitext(excel_file)[0]
-            if not any(difflib.SequenceMatcher(None, excel_file_name, folder[0]).ratio() >= 0.8 for folder in folder_info_list):
-                filtered_excel_info_list.append(excel_file)
+        # 更新完整列表
+        self.full_folder_list = folder_info_list + [("Excel", excel) for excel in excel_info_list]
 
-        # 将文件夹信息添加到列表控件
-        for item, image_count, other_count in folder_info_list:
-            list_item_text = f"图 {image_count}"
-            if other_count > 0:
-                list_item_text += f" | 其它 {other_count}"
-            list_item_text += f" | {item}"
-
+        for item in self.full_folder_list:
+            if isinstance(item, tuple) and len(item) == 3:
+                folder_name, image_count, other_count = item
+                list_item_text = f"图 {image_count}"
+                if other_count > 0:
+                    list_item_text += f" | 其它 {other_count}"
+                list_item_text += f" | {folder_name}"
+            else:
+                list_item_text = f"Excel | {item[1]}"
+            
             list_item = QListWidgetItem(list_item_text)
-            if item in self.initial_folder_info and self.initial_folder_info[item] != current_folder_info[item]:
-                list_item.setBackground(QColor('#FFBA5D'))  # 使用自定义高亮颜色
+            
+            # 检查文件夹是否发生变化并高亮显示
+            if isinstance(item, tuple) and len(item) == 3:
+                if item[0] in self.initial_folder_info and self.initial_folder_info[item[0]] != current_folder_info.get(item[0], {}):
+                    list_item.setBackground(QColor('#FFBA5D'))
+                    if first_highlighted_item is None:
+                        first_highlighted_item = list_item
 
-            self.list_widget.addItem(list_item)
-
-        # 将过滤后的Excel文件信息添加到列表控件
-        for excel_file in filtered_excel_info_list:
-            list_item = QListWidgetItem(f"Excel | {excel_file}")
             self.list_widget.addItem(list_item)
 
         # 更新初始文件夹状态
         self.initial_folder_info = current_folder_info
 
+        # 滚动到第一个高亮项目
+        if first_highlighted_item:
+            self.list_widget.scrollToItem(first_highlighted_item, QAbstractItemView.PositionAtCenter)
+
+    def count_files_fast(self, folder_path):
+        """
+        快速计算指定文件夹中的图片和其他文件数量。
+        优化点：使用集合进行文件扩展名检查，减少字符串操作。
+        """
+        image_count = 0
+        other_count = 0
+        # 使用集合存储文件扩展名，提高查找效率
+        image_extensions = {'.jpg', '.jpeg', '.png', '.gif'}
+        other_extensions = {'.txt', '.pdf', '.docx'}
+        
+        # 使用 os.scandir() 高效遍历文件夹
+        with os.scandir(folder_path) as entries:
+            for entry in entries:
+                if entry.is_file():
+                    ext = os.path.splitext(entry.name)[1].lower()
+                    if ext in image_extensions:
+                        image_count += 1
+                    elif ext in other_extensions:
+                        other_count += 1
+        
+        return image_count, other_count
 
 
     def update_folder_list(self, search_term):
+        """
+        根据搜索词更新文件夹列表，不重新计算文件数量。
+        """
         self.list_widget.clear()  # 清空当前列表
-        folder_info_list = []  # 存储文件夹名称和图片数量
-        excel_info_list = []  # 单独存储Excel文件信息
+        search_term = search_term.lower()
 
-        if os.path.isdir(self.folder_path):
-            for item in os.listdir(self.folder_path):
-                # 跳过以 '~$' 开头的临时文件
-                if item.startswith('~$'):
-                    continue
+        for item in self.full_folder_list:
+            if isinstance(item, tuple) and len(item) == 3:
+                folder_name, image_count, other_count = item
+                if search_term in folder_name.lower():
+                    list_item_text = f"图 {image_count}"
+                    if other_count > 0:
+                        list_item_text += f" | 其它 {other_count}"
+                    list_item_text += f" | {folder_name}"
+                    self.list_widget.addItem(list_item_text)
+            elif item[0] == "Excel" and search_term in item[1].lower():
+                self.list_widget.addItem(f"Excel | {item[1]}")
 
-                full_path = os.path.join(self.folder_path, item)
-                if os.path.isdir(full_path):
-                    image_count = self.count_files(full_path, ['.jpg', '.jpeg', '.png', '.gif'])
-                    other_count = self.count_files(full_path, ['.txt', '.pdf', '.docx'])
-                    folder_info_list.append((item, image_count, other_count))
-                elif item.lower().endswith('.xlsx'):
-                    excel_info_list.append(item)
-
-        # 过滤和排序文件夹列表
-        filtered_folder_list = [info for info in folder_info_list if search_term in info[0].lower()]
-        filtered_folder_list.sort(key=lambda x: x[0].lower().find(search_term))
-
-        # 过滤掉与文件夹名称高度相似的Excel文件
-        filtered_excel_info_list = []
-        for excel_file in excel_info_list:
-            excel_file_name = os.path.splitext(excel_file)[0]
-            if not any(difflib.SequenceMatcher(None, excel_file_name, folder[0]).ratio() >= 0.8 for folder in filtered_folder_list):
-                if search_term in excel_file.lower():
-                    filtered_excel_info_list.append(excel_file)
-        filtered_excel_info_list.sort()
-
-        # 将过滤后的文件夹信息添加到列表控件
-        for item, image_count, other_count in filtered_folder_list:
-            list_item = f"图 {image_count}"
-            if other_count > 0:
-                list_item += f" | 其它 {other_count}"
-            list_item += f" | {item}"
-            self.list_widget.addItem(list_item)
-
-        # 将过滤后的Excel文件信息添加到列表控件
-        for excel_file in filtered_excel_info_list:
-            list_item = QListWidgetItem(f"Excel | {excel_file}")
-            self.list_widget.addItem(list_item)
 
 
 
@@ -3156,32 +3525,41 @@ class FolderListDialog(QDialog):
             self.initial_folder_info = self.record_all_folder_info()  # 重新记录初始状态
 
     def record_all_folder_info(self):
-        """记录所有文件夹的初始状态"""
+        """
+        记录所有文件夹的信息。
+        优化点：使用 os.scandir() 提高遍历效率。
+        """
         folder_info = {}
-
-        # 检查路径是否为空或不存在
         if not self.folder_path or not os.path.exists(self.folder_path):
             print("无效的路径或路径不存在。")
             return folder_info
 
-        for folder_name in os.listdir(self.folder_path):
-            folder_path = os.path.join(self.folder_path, folder_name)
-            if os.path.isdir(folder_path):
-                folder_info[folder_name] = self.record_folder_info(folder_path)
+        # 使用 os.scandir() 高效遍历文件夹
+        with os.scandir(self.folder_path) as entries:
+            for entry in entries:
+                if entry.is_dir():
+                    folder_info[entry.name] = self.record_folder_info(entry.path)
 
         return folder_info
 
-
     def record_folder_info(self, folder_path):
-        """记录单个文件夹的文件数量和哈希值"""
+        """
+        记录单个文件夹的信息。
+        优化点：合并文件计数和哈希计算，减少遍历次数。
+        """
         file_count = 0
         file_hashes = {}
-        for file_name in os.listdir(folder_path):
-            if file_name.lower().endswith(('.png', '.jpg', '.jpeg', '.gif')):
-                file_count += 1
-                file_path = os.path.join(folder_path, file_name)
-                file_hash = self.get_file_hash(file_path)
-                file_hashes[file_name] = file_hash
+        image_extensions = {'.png', '.jpg', '.jpeg', '.gif'}
+        
+        # 使用 os.scandir() 高效遍历文件夹
+        with os.scandir(folder_path) as entries:
+            for entry in entries:
+                if entry.is_file() and os.path.splitext(entry.name)[1].lower() in image_extensions:
+                    file_count += 1
+                    # 计算文件哈希值
+                    file_hash = self.get_file_hash(entry.path)
+                    file_hashes[entry.name] = file_hash
+        
         return {'file_count': file_count, 'file_hashes': file_hashes}
 
     def get_file_hash(self, file_path):
@@ -3271,6 +3649,9 @@ class FolderListDialog(QDialog):
         # 更新重命名对话框的引用
         self.rename_dialog = dialog
 
+        # 设置初始位置
+        self.update_rename_dialog_position()
+
         # 连接对话框的关闭信号
         dialog.finished.connect(lambda: setattr(self, 'rename_dialog', None))
 
@@ -3310,6 +3691,13 @@ class FolderListDialog(QDialog):
         dialog.setWindowTitle("重命名图片")
         dialog.show()
 
+    def update_rename_dialog_position(self):
+        if self.rename_dialog:
+            parent_geo = self.geometry()
+            dialog_width = self.rename_dialog.width()
+            new_x = parent_geo.right()
+            new_y = parent_geo.top()
+            self.rename_dialog.move(new_x, new_y)
 
     def find_most_similar_folder(self, image_name, similarity_threshold=0.6):
         most_similar = None
